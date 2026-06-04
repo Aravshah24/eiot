@@ -12,13 +12,39 @@ import streamlit as st
 
 from camera_manager import create_camera_manager
 from intrusion_detector import DEFAULT_POLYGON_POINTS
-from esp32_alert import build_pest_alert_command, send_serial_command
+from esp32_alert import build_alert_command, send_serial_command
 from vla_engine import decide_action
 
 st.set_page_config(
     page_title="Smart Farmland Monitoring",
     page_icon="🌾",
-    layout="wide"
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 2rem;}
+    div[data-testid="stMetric"] {
+        background: #1c1f26;
+        border: 1px solid #2c313c;
+        border-radius: 14px;
+        padding: 16px 18px;
+    }
+    div[data-testid="stMetricLabel"] {opacity: 0.8;}
+    .alert-banner {
+        border-radius: 14px;
+        padding: 16px 20px;
+        margin: 6px 0 18px 0;
+        font-size: 1.1rem;
+        font-weight: 600;
+        border: 1px solid;
+    }
+    .alert-danger {background: #3a1416; border-color: #ff4b4b; color: #ff8585;}
+    .alert-ok     {background: #11291a; border-color: #1fad5b; color: #4ade80;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.title("🌾 Smart Farmland Monitoring & Intrusion Detection System")
@@ -26,6 +52,16 @@ st.title("🌾 Smart Farmland Monitoring & Intrusion Detection System")
 st.sidebar.header("System Settings")
 camera_source_input = st.sidebar.text_input("Camera source", value="0")
 serial_port = st.sidebar.text_input("ESP32 COM port", value="COM6")
+
+st.sidebar.subheader("Pest Detection")
+pest_confidence = st.sidebar.slider(
+    "Pest confidence threshold", 0.10, 0.95, 0.60, 0.05,
+    help="Higher = fewer false alarms. This model over-detects 'fruit fly' on backgrounds, so keep this high.",
+)
+pest_interval = st.sidebar.slider(
+    "Pest check interval (s)", 1.0, 60.0, 2.0, 1.0,
+    help="How often the pest model runs on the camera frame.",
+)
 
 camera_sidebar = st.sidebar.container()
 
@@ -48,7 +84,8 @@ def get_camera_manager(source_value: int | str):
         source=source_value,
         polygon_points=DEFAULT_POLYGON_POINTS,
         intrusion_interval=0.15,
-        pest_interval=60.0,
+        pest_interval=2.0,
+        pest_confidence=0.6,
     )
 
 
@@ -91,6 +128,9 @@ ser = None
 
 try:
     camera_manager = get_camera_manager(_parse_camera_source(camera_source_input))
+    # Live-tune the running detector from the sidebar sliders.
+    camera_manager.pest_confidence = float(pest_confidence)
+    camera_manager.pest_interval = float(pest_interval)
 except Exception as exc:
     st.sidebar.error(f"Camera unavailable: {exc}")
 
@@ -102,15 +142,11 @@ except Exception as exc:
 temp_history = deque(maxlen=50)
 humidity_history = deque(maxlen=50)
 
-camera_placeholder = st.empty()
+banner_placeholder = st.empty()
 status_placeholder = st.empty()
-chart_placeholder = st.empty()
 
 last_sensor = st.session_state.get("latest_sensor_snapshot", {"temp": 0.0, "humidity": 0.0, "pir": 0})
-last_pest_alert_state = st.session_state.get("last_pest_alert_state", False)
-last_pest_alert_type = st.session_state.get("last_pest_alert_type")
-last_pest_alert_sent_at = float(st.session_state.get("last_pest_alert_sent_at", 0.0))
-PEST_ALERT_REFRESH_SECONDS = 5.0
+ALERT_REFRESH_SECONDS = 5.0
 
 while True:
     try:
@@ -131,33 +167,61 @@ while True:
         }
         decision = decide_action(system_state, last_sensor)
 
-        pest_alert_active = bool(system_state["pest_detected"])
-        pest_alert_type = system_state.get("pest_type")
+        intrusion_active = bool(system_state["intrusion"])
+        intrusion_object = system_state.get("intrusion_object")
+        pest_active = bool(system_state["pest_detected"])
+        pest_type = system_state.get("pest_type")
+        pir_active = bool(pir)
+
+        # ---- Unified ESP32 buzzer/alert: ANY threat sounds the buzzer ----
+        alert_active = intrusion_active or pir_active or pest_active
+        active_reasons = set()
+        if intrusion_active:
+            active_reasons.add("intrusion")
+        if pir_active:
+            active_reasons.add("pir")
+        if pest_active:
+            active_reasons.add("pest")
+
+        # Popup toasts only when a NEW reason appears (rising edge).
+        previous_reasons = set(st.session_state.get("previous_alert_reasons", set()))
+        new_reasons = active_reasons - previous_reasons
+        if "intrusion" in new_reasons:
+            st.toast(f"🚨 Intrusion: {intrusion_object or 'intruder'} in restricted area!", icon="🚨")
+        if "pir" in new_reasons:
+            st.toast("🚶 Physical breach detected by PIR sensor!", icon="🚶")
+        if "pest" in new_reasons:
+            st.toast(f"🐛 Pest detected: {pest_type or 'unknown'}!", icon="🐛")
+        st.session_state["previous_alert_reasons"] = active_reasons
+
+        # Resend on state change OR periodically while active (keeps buzzer alive).
+        alert_signature = (alert_active, tuple(sorted(active_reasons)), pest_type, intrusion_object)
+        last_signature = st.session_state.get("last_alert_signature")
+        last_sent_at = float(st.session_state.get("last_alert_sent_at", 0.0))
         current_time = time.monotonic()
-        should_send_pest_alert = (
-            pest_alert_active != last_pest_alert_state
-            or pest_alert_type != last_pest_alert_type
-            or (
-                pest_alert_active
-                and current_time - last_pest_alert_sent_at >= PEST_ALERT_REFRESH_SECONDS
-            )
+        should_send = (
+            alert_signature != last_signature
+            or (alert_active and current_time - last_sent_at >= ALERT_REFRESH_SECONDS)
         )
 
-        if ser is not None and should_send_pest_alert:
+        if ser is not None and should_send:
             try:
                 send_serial_command(
                     ser,
-                    build_pest_alert_command(pest_alert_type, pest_alert_active)
+                    build_alert_command(
+                        intrusion=intrusion_active,
+                        pir=pir_active,
+                        pest=pest_active,
+                        pest_type=pest_type,
+                        intrusion_object=intrusion_object,
+                    ),
                 )
                 st.session_state["last_esp32_alert_status"] = (
-                    f"Sent pest alert to ESP32: {'ON' if pest_alert_active else 'OFF'}"
+                    f"Sent alert to ESP32: buzzer {'ON' if alert_active else 'OFF'}"
+                    + (f" ({', '.join(sorted(active_reasons))})" if active_reasons else "")
                 )
-                last_pest_alert_state = pest_alert_active
-                last_pest_alert_type = pest_alert_type
-                last_pest_alert_sent_at = current_time
-                st.session_state["last_pest_alert_state"] = last_pest_alert_state
-                st.session_state["last_pest_alert_type"] = last_pest_alert_type
-                st.session_state["last_pest_alert_sent_at"] = last_pest_alert_sent_at
+                st.session_state["last_alert_signature"] = alert_signature
+                st.session_state["last_alert_sent_at"] = current_time
             except Exception as exc:
                 st.sidebar.error(f"Failed to send ESP32 alert: {exc}")
 
@@ -165,180 +229,127 @@ while True:
             temp_history.append(temp)
             humidity_history.append(humidity)
 
+        # ---- Top alert banner ----
+        with banner_placeholder.container():
+            if alert_active:
+                labels = {
+                    "intrusion": f"Virtual intrusion ({intrusion_object or 'intruder'})",
+                    "pir": "Physical PIR breach",
+                    "pest": f"Pest ({pest_type or 'unknown'})",
+                }
+                items = " · ".join(labels[r] for r in ("intrusion", "pir", "pest") if r in active_reasons)
+                st.markdown(
+                    f'<div class="alert-banner alert-danger">🔔 BUZZER ON — {items}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="alert-banner alert-ok">✅ All clear — no active threats</div>',
+                    unsafe_allow_html=True,
+                )
+
         with status_placeholder.container():
 
             col1, col2, col3, col4 = st.columns(4)
-
-            col1.metric(
-                "🌡 Temperature",
-                f"{temp:.1f} °C"
-            )
-
-            col2.metric(
-                "💧 Humidity",
-                f"{humidity:.1f} %"
-            )
-
-            col3.metric(
-                "🚨 PIR Status",
-                "Motion" if pir else "Clear"
-            )
-
-            col4.metric(
-                "🎯 Intrusion Status",
-                "Intrusion" if system_state["intrusion"] else "Clear"
-            )
+            col1.metric("🌡 Temperature", f"{temp:.1f} °C")
+            col2.metric("💧 Humidity", f"{humidity:.1f} %")
+            col3.metric("🚶 PIR Status", "Motion" if pir else "Clear")
+            col4.metric("🎯 Intrusion", "Detected" if intrusion_active else "Clear")
 
             st.divider()
 
-            st.subheader("Active Alerts")
+            left, right = st.columns([3, 2])
 
-            if system_state["intrusion"]:
-                st.error(
-                    f"🚨 Virtual intrusion detected: {system_state['intrusion_object']}"
-                )
+            with left:
+                st.subheader("📷 Live Camera (geofence · intrusion · pest)")
+                if camera_manager is None:
+                    st.warning("Camera manager is not running")
+                else:
+                    latest_frame = camera_manager.get_latest_frame()
+                    if latest_frame is not None:
+                        st.image(frame_to_rgb(latest_frame), use_container_width=True)
+                    else:
+                        st.info("Waiting for a captured frame...")
 
-            if pir:
-                st.warning("🚨 Physical intrusion detected by PIR")
+                if camera_manager is not None and getattr(camera_manager, "backend_window_error", None):
+                    st.warning(f"Backend window error: {camera_manager.backend_window_error}")
 
-            if temp > 35:
-                st.warning("🔥 High Temperature Alert")
+            with right:
+                st.subheader("Active Alerts")
 
-            if humidity > 85:
-                st.warning("🦠 High Disease Risk")
+                if intrusion_active:
+                    st.error(f"🚨 Virtual intrusion: {intrusion_object}")
+                if pir:
+                    st.warning("🚶 Physical intrusion detected by PIR")
+                if pest_active:
+                    st.warning(f"🐛 Pest detected: {pest_type}")
+                if temp > 35:
+                    st.warning("🔥 High Temperature Alert")
+                if humidity > 85:
+                    st.warning("🦠 High Disease Risk")
+                if not alert_active and temp <= 35 and humidity <= 85:
+                    st.success("✅ No Active Alerts")
 
-            if system_state["pest_detected"]:
-                st.warning(
-                    f"🐛 Pest detected: {system_state['pest_type']}"
-                )
-
-            if not pir and temp <= 35 and humidity <= 85 and not system_state["intrusion"] and not system_state["pest_detected"]:
-                st.success("✅ No Active Alerts")
-
-            st.info(f"🧠 Recommended Action: {decision['action']}")
-            st.caption(st.session_state.get("last_esp32_alert_status", "ESP32 alert has not been sent yet"))
+                st.info(f"🧠 Recommended Action: {decision['action']}")
+                st.caption(st.session_state.get("last_esp32_alert_status", "ESP32 alert has not been sent yet"))
+                st.metric("Last Pest Check", system_state["last_pest_check"] or "Pending")
 
             st.divider()
 
             chart_col1, chart_col2 = st.columns(2)
 
             with chart_col1:
-
                 st.subheader("Temperature Trend")
-
                 temp_df = pd.DataFrame({
                     "Reading": list(range(len(temp_history))),
-                    "Temperature": list(temp_history)
+                    "Temperature": list(temp_history),
                 })
-
-                fig1 = px.line(
-                    temp_df,
-                    x="Reading",
-                    y="Temperature"
-                )
-
-                st.plotly_chart(
-                    fig1,
-                    width="stretch",
-                    key="temperature_trend_chart"
-                )
+                fig1 = px.line(temp_df, x="Reading", y="Temperature")
+                st.plotly_chart(fig1, use_container_width=True, key="temperature_trend_chart")
 
             with chart_col2:
-
                 st.subheader("Humidity Trend")
-
                 hum_df = pd.DataFrame({
                     "Reading": list(range(len(humidity_history))),
-                    "Humidity": list(humidity_history)
+                    "Humidity": list(humidity_history),
                 })
-
-                fig2 = px.line(
-                    hum_df,
-                    x="Reading",
-                    y="Humidity"
-                )
-
-                st.plotly_chart(
-                    fig2,
-                    width="stretch",
-                    key="humidity_trend_chart"
-                )
+                fig2 = px.line(hum_df, x="Reading", y="Humidity")
+                st.plotly_chart(fig2, use_container_width=True, key="humidity_trend_chart")
 
             st.divider()
 
-            st.subheader("🐛 Pest Detection Snapshot")
+            st.subheader("🧠 VLA Decision Engine")
+            decisions = []
+            if intrusion_active:
+                decisions.append(f"Intrusion detected → Alert farmer + sound buzzer ({intrusion_object})")
+            if pir_active:
+                decisions.append("Physical breach (PIR) → Sound buzzer")
+            if pest_active:
+                decisions.append(f"Pest detected → Recommend pest control for {pest_type} + sound buzzer")
+            if temp > 35:
+                decisions.append("Temperature high → Monitor crops")
+            if humidity > 85:
+                decisions.append("Humidity high → Disease risk")
+            if not decisions:
+                decisions.append("Normal conditions")
+            for d in decisions:
+                st.write("•", d)
 
-            if camera_manager is None:
-                st.warning("Camera manager is not running")
+            if alert_active:
+                st.warning("ESP32 alert active: buzzer and light flashing")
             else:
-                latest_frame = camera_manager.get_latest_frame()
-                if latest_frame is not None:
-                    st.image(frame_to_rgb(latest_frame), caption="Captured frame used for pest analysis", width="stretch")
-                else:
-                    st.info("Waiting for a captured frame...")
-
-            if system_state["pest_detected"]:
-                st.error(f"Pest detected: {system_state['pest_type']}")
-            else:
-                st.success("No pest detected")
-
-            st.metric("Last Pest Check", system_state["last_pest_check"] or "Pending")
-
-            if camera_manager is not None and getattr(camera_manager, "backend_window_error", None):
-                st.warning(f"Backend window error: {camera_manager.backend_window_error}")
-
-            st.divider()
+                st.caption("ESP32 alert is idle")
 
         with camera_sidebar:
             st.subheader("📷 Camera Window")
-
             if camera_manager is None:
                 st.warning("Camera manager unavailable")
             else:
                 sidebar_frame = camera_manager.get_latest_frame()
                 if sidebar_frame is not None:
-                    st.image(frame_to_rgb(sidebar_frame), caption="Live camera window", width="stretch")
+                    st.image(frame_to_rgb(sidebar_frame), caption="Live camera window", use_container_width=True)
                 else:
                     st.info("Waiting for camera window...")
-
-        st.subheader("🧠 VLA Decision Engine")
-
-        decisions = []
-
-        if system_state["intrusion"]:
-            decisions.append(
-                "Intrusion detected → Alert farmer"
-            )
-
-        if system_state["pest_detected"]:
-            decisions.append(
-                f"Pest detected → Recommend pest control for {system_state['pest_type']}"
-            )
-
-        if temp > 35:
-            decisions.append(
-                "Temperature high → Monitor crops"
-            )
-
-        if humidity > 85:
-            decisions.append(
-                "Humidity high → Disease risk"
-            )
-
-        if len(decisions) == 0:
-            decisions.append(
-                "Normal conditions"
-            )
-
-        for d in decisions:
-            st.write("•", d)
-
-        if decision.get("esp32_alert", {}).get("active"):
-            st.warning("ESP32 alert active: buzzer and light flashing")
-        elif system_state["pest_detected"]:
-            st.info("ESP32 alert command sent")
-        else:
-            st.caption("ESP32 pest alert is idle")
 
     except Exception as e:
         st.error(str(e))

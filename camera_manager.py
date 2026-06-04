@@ -35,7 +35,8 @@ class CameraManager:
         source: int | str = 0,
         polygon_points: Sequence[Sequence[int]] | np.ndarray | None = None,
         intrusion_interval: float = 0.15,
-        pest_interval: float = 60.0,
+        pest_interval: float = 2.0,
+        pest_confidence: float = 0.6,
         show_backend_window: bool = True,
         backend_window_name: str = "Smart Farm Backend View",
     ) -> None:
@@ -46,6 +47,7 @@ class CameraManager:
         )
         self.intrusion_interval = intrusion_interval
         self.pest_interval = pest_interval
+        self.pest_confidence = pest_confidence
         self.show_backend_window = show_backend_window
         self.backend_window_name = backend_window_name
 
@@ -137,7 +139,7 @@ class CameraManager:
                     self.system_state["intrusion_object"] = intrusion_result["object"] if intrusion_result else None
 
             if now - self._last_pest_check >= self.pest_interval:
-                pest_result = detect_pest(frame)
+                pest_result = detect_pest(frame, confidence_threshold=self.pest_confidence)
                 self._last_pest_check = now
 
                 with self._lock:
@@ -219,7 +221,8 @@ def create_camera_manager(
     source: int | str = 0,
     polygon_points: Sequence[Sequence[int]] | np.ndarray | None = None,
     intrusion_interval: float = 0.15,
-    pest_interval: float = 60.0,
+    pest_interval: float = 2.0,
+    pest_confidence: float = 0.6,
     show_backend_window: bool = True,
     backend_window_name: str = "Smart Farm Backend View",
 ) -> CameraManager:
@@ -228,6 +231,7 @@ def create_camera_manager(
         polygon_points=polygon_points,
         intrusion_interval=intrusion_interval,
         pest_interval=pest_interval,
+        pest_confidence=pest_confidence,
         show_backend_window=show_backend_window,
         backend_window_name=backend_window_name,
     )

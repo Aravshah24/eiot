@@ -19,14 +19,16 @@ def decide_action(system_state: Mapping[str, Any], sensor_data: Mapping[str, Any
     temperature = _to_float(sensor_data.get("temp", sensor_data.get("temperature")))
 
     if intrusion:
+        intruder = system_state.get("intrusion_object") or "intruder"
         return {
-            "action": "Alert Farmer",
+            "action": f"Alert Farmer: {intruder} in restricted area",
             "alert_type": "intrusion",
             "esp32_alert": {
-                "active": False,
-                "buzzer": 0,
-                "light": 0,
-                "flash": 0,
+                "active": True,
+                "buzzer": 1,
+                "light": 1,
+                "flash": 1,
+                "intrusion_object": intruder,
             },
         }
 

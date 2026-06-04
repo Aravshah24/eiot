@@ -59,7 +59,7 @@ def detect_pest(
     frame,
     model: Any | None = None,
     model_path: str | Path | None = None,
-    confidence_threshold: float = 0.25,
+    confidence_threshold: float = 0.6,
 ) -> dict[str, Any] | None:
     if frame is None:
         return None
